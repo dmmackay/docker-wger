@@ -1,11 +1,11 @@
 <img src="https://raw.githubusercontent.com/wger-project/wger/master/wger/core/static/images/logos/logo.png" width="100" height="100" alt="wger logo" />
 
 
-# Production...ish docker-compose image for wger
+# Production...ish docker compose image for wger
 
 ## Usage
 
-This docker-compose file starts up a production environment with gunicorn
+This docker compose file starts up a production environment with gunicorn
 as the webserver, postgres as a database and redis for caching with nginx
 used as a reverse proxy. If you want to develop, take a look at the docker
 compose file in the application repository.
@@ -19,21 +19,78 @@ It is recommended to regularly pull the latest version of the images from this
 repository, since sometimes new configurations or environmental variables are
 added.
 
+### Configuration
+
+Instead of editing the compose file or the env file directly, it is recommended
+to extend it. That way you can more easily pull changes from this repository.
+
+For example, you might not want to run the application on port 80 because some
+other service in your network is already using it. For this, simply create a new
+file called `docker-compose.override.yml` with the following content:
+
+    services:
+      nginx:
+        ports:
+          - "8080:80"
+
+Now the port setting will be overwritten from the configured nginx service when
+you do a `docker compose up`. However, note that compose will concatenate both sets
+of values so in this case the application will be binded to 8080 (from the override)
+*and* 80 (from the regular compose file). It seems that at the moment the only
+workaround is remove the ports settings altogether from the compose file.
+
+The same applies to the env variables, just create a new file called e.g. `my.env`
+and add it after the provided `prod.env` for the web service (again, this is
+`docker-compose.override.yml`). There you add the settings that you changed, and only
+those, which makes it easier to troubleshoot, etc.:
+
+    web:
+      env_file:
+        - ./config/prod.env
+        - ./config/my.env
+
+To add a web interface for the celery queue, add a new service to the override file:
+
+    celery_flower:
+      image: wger/server:latest
+      container_name: wger_celery_flower
+      command: /start-flower
+      env_file:
+        - ./config/prod.env
+      ports:
+        - "5555:5555"
+      healthcheck:
+        test: wget --no-verbose --tries=1 http://localhost:5555/healthcheck
+        interval: 10s
+        timeout: 5s
+        retries: 5
+      depends_on:
+        celery_worker:
+          condition: service_healthy
+
+For more information and possibilities consult <https://docs.docker.com/compose/extends/>
+
 ### 1 - Start
 
 To start all services:
 
-    docker-compose up -d
+    docker compose up -d
   
-Optionally download current exercises from wger.de, exercise images and
-the ingredients (will take some time):
+Optionally download current exercises, exercise images and the ingredients 
+from wger.de. Please note that `load-online-fixtures` will overwrite any local
+changes you might have while `sync-ingredients` should be used afterward once
+you have imported the initial fixtures:
 
-    docker-compose exec web python3 manage.py sync-exercises
-    docker-compose exec web python3 manage.py download-exercise-images
-    docker-compose exec web wger load-online-fixtures
+    docker compose exec web python3 manage.py sync-exercises
+    docker compose exec web python3 manage.py download-exercise-images
+    docker compose exec web python3 manage.py download-exercise-videos
+ 
+    docker compose exec web wger load-online-fixtures
+    # afterwards:
+    docker compose exec web python3 manage.py sync-ingredients
 
-(these steps can be configured to run automatically on startup, see the options
-in `prod.env`.)
+(these steps are configured by default to run regularly in the background, but 
+can also run on startup as well, see the options in `prod.env`.)
     
 
 Then open <http://localhost> (or your server's IP) and log in as: **admin**,
@@ -44,36 +101,35 @@ password **adminadmin**
 
 Just remove the containers and pull the newest version:
 
-    docker-compose down
-    docker-compose pull
-    docker-compose up
+    docker compose down
+    docker compose pull
+    docker compose up
 
 ### 3 - Lifecycle Management
 
 To stop all services issue a stop command, this will preserve all containers
 and volumes:
 
-    docker-compose stop
+    docker compose stop
 
 To start everything up again:
 
-    docker-compose start
+    docker compose start
 
 To remove all containers (except for the volumes)
 
-    docker-compose down
+    docker compose down
 
 To view the logs:
 
-    docker-compose logs -f
-
+    docker compose logs -f
 
 You might need to issue other commands or do other manual work in the container,
 e.g.
 
-     docker-compose exec web yarn install
-     docker-compose exec --user root web /bin/bash
-
+     docker compose exec web yarn install
+     docker compose exec --user root web /bin/bash
+     docker compose exec --user postgres db psql wger -U wger
 
 ## Deployment
 
@@ -114,7 +170,7 @@ server {
 }
 ```
 
-### Read this if you use HTTPS
+### If you get CSRF errors
 
 If you want to use HTTPS like in the example config you need to add some
 additional configurations. Since the HTTPS connections are reversed proxied,
@@ -126,6 +182,9 @@ To solve this, update the env file and either
 
 * manually set a list of your domain names and/or server IPs 
   `CSRF_TRUSTED_ORIGINS=https://my.domain.example.com,https://118.999.881.119`
+  If you are unsure what origin to add here, set the debug setting to true, restart
+  and try again, the error message that appears will have the origin prominently
+  displayed.
 * or set the `X-Forwarded-Proto` header like in the example and set
   `X_FORWARDED_PROTO_HEADER_SET=True`. If you do this consult the
   [documentation](https://docs.djangoproject.com/en/4.1/ref/settings/#secure-proxy-ssl-header)
@@ -133,6 +192,103 @@ To solve this, update the env file and either
 
 You might want to set `DJANGO_DEBUG` to true while you are debugging this is you
 encounter errors.
+
+
+### Automatically start service
+
+If everything works correctly, you will want to start the compose file as a
+service so that it auto restarts when you reboot the server. If you use systemd,
+this can be done with a simple file. Create the file `/etc/systemd/system/wger.service`
+and enter the following content (check where the absolute path of the docker
+command is with `which docker`)
+
+```
+[Unit]
+Description=wger docker compose service
+PartOf=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+WorkingDirectory=/path/to/the/docker/compose/
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Read the file with `systemctl daemon-reload` and start it with
+`systemctl start wger`. If there are no errors and `systemctl status wger`
+shows that the service is active (this might take some time), everything went
+well. With `systemctl enable wger` the service will be automatically restarted
+after a reboot.
+
+### Backup
+
+**Database volume:** The most important thing to backup. For this just make
+a dump and restore it when needed
+
+```
+# Stop all other containers so the db is not changed while you export it
+docker compose stop web nginx cache celery_worker celery_beat
+docker compose exec db pg_dumpall --clean --username wger > backup.sql
+docker compose start
+
+# When you need to restore it
+docker compose stop
+docker volume remove docker_postgres-data
+docker compose up db
+cat backup.sql | docker compose exec -T db psql --username wger --dbname wger
+docker compose up
+```
+
+**Media volume:** If you haven't uploaded any own images (exercises, gallery),
+you don't need to backup this, the contents can just be downloaded again. If
+you have, please consult these possibilities:
+
+* <https://www.docker.com/blog/back-up-and-share-docker-volumes-with-this-extension/>
+* <https://github.com/BretFisher/docker-vackup>
+
+
+**Static volume:** The contents of this volume are 100% generated and recreated
+on startup, no need to backup anything
+
+### Postgres Upgrade
+
+It is sadly not possible to automatically upgrade between postgres versions,
+you need to perform the upgrade manually. Since the amount of data the app
+generates is small a simple dump and restore is the simplest way to do this.
+
+If you pulled new changes from this repo and got the error message "The data
+directory was initialized by PostgreSQL version 12, which is not compatible
+with this version 15." this is for you.
+
+See also <https://github.com/docker-library/postgres/issues/37>
+
+
+```bash
+# Checkout the last version of the composer file that uses postgres 12 
+git checkout pg-12
+
+# Stop all other containers
+docker compose stop web nginx cache celery_worker celery_beat
+
+# Make a dump of the database and remove the container and volume
+docker compose exec db pg_dumpall --clean --username wger > backup.sql
+docker compose stop db
+docker compose down
+docker volume remove docker_postgres-data
+
+# Checkout current version, import the dump and start everything
+git checkout master
+docker compose up db
+cat backup.sql | docker compose exec -T db psql --username wger --dbname wger
+docker compose exec -T db psql --username wger --dbname wger -c "ALTER USER wger WITH PASSWORD 'wger'"
+docker compose up
+rm backup.sql
+```
 
 ## Building
 
